@@ -17,11 +17,21 @@ https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision
 """
 import math
 from functools import partial
+import logging
 
 import torch
 import torch.nn as nn
 
+import numpy as np
+import torchvision.transforms as T
+import torchvision.transforms.functional as F
+
 from utils import trunc_normal_
+
+VERBOSE = False
+
+logger = logging.getLogger(__name__)
+logging.getLogger().setLevel(level=logging.DEBUG)
 
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
@@ -78,15 +88,28 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
+        if VERBOSE: print(f"Attention.forward: input x.shape: {x.shape}")
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x)
+        if VERBOSE: print(f"Run input through linear layer to get values for K, Q, V, get shape: {qkv.shape}")
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        if VERBOSE: print(f"Reshape to {qkv.shape}")
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        if VERBOSE: print(f"permute to {qkv.shape}")
         q, k, v = qkv[0], qkv[1], qkv[2]
+        if VERBOSE: print(f"Attention.forward key values")
+        if VERBOSE: print(f"q.shape: {q.shape}")
+        if VERBOSE: print(f"k.shape: {k.shape}")
+        if VERBOSE: print(f"v.shape: {v.shape}")
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
+        if VERBOSE: print(f"attn.shape before value multiplication: {attn.shape}")
+        if VERBOSE: print(f"(901, 901) are the attention values - how much each token attend to each token.")
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if VERBOSE: print(f"x.shape after attn@v: {x.shape}")
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
@@ -110,6 +133,7 @@ class Block(nn.Module):
             return attn
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if VERBOSE: print(f"Block.forward before return x.shape: {x.shape}")
         return x
 
 
@@ -127,7 +151,14 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        if VERBOSE: print(f"""Run PatchEmbed. Run Conv2d on input image with kernel size: {self.patch_size}, 
+        stride: {self.patch_size}.""")
+        if VERBOSE: print(f"proj(x).shape: {x.shape}")
+        x = x.flatten(2)
+        if VERBOSE: print(f"After x.flatten(2): {x.shape}")
+        x = x.transpose(1, 2)
+        if VERBOSE: print(f"After x.transpose(1,2): {x.shape}")
         return x
 
 
@@ -138,6 +169,8 @@ class VisionTransformer(nn.Module):
                  drop_path_rate=0., norm_layer=nn.LayerNorm, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
+
+        if VERBOSE: print("Initialized VisionTransformer")
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -193,9 +226,36 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
 
-    def prepare_tokens(self, x):
-        B, nc, w, h = x.shape
-        x = self.patch_embed(x)  # patch linear embedding
+    def prepare_tokens(self, x_orig, crop=True):
+        B, nc, w, h = x_orig.shape
+        x = self.patch_embed(x_orig)  # patch linear embedding
+        if VERBOSE: print(f"x.shape before crop: {x.shape}")
+        i, j, ww, hh = 0, 0, 0, 0
+        
+        if crop:
+            # Random crop between size 5% and 10%
+            x = x.permute(0, 2, 1)
+            n_square = np.sqrt(x.shape[-1]).astype(int)
+            x = x.reshape(x.shape[0], x.shape[1], n_square, n_square)
+
+            p_crop = np.random.choice(range(5,20))
+            n_crop = round(x.shape[-1] * (p_crop / 100))
+            print(f"Cropped: {round(p_crop)}%")
+            
+            c = T.RandomCrop(n_crop)
+            
+            i, j, ww, hh = c.get_params(x, (n_crop, n_crop))
+            mask = F.crop(x, i, j, ww, hh)
+            
+            mask[:] = 0
+            
+            x[:, :, i:(i+ww), j:(j+hh)] = mask
+            if VERBOSE: print(f"x.shape after crop: {x.shape}")
+
+            x = x.reshape(x.shape[0], x.shape[1], -1)
+            x = x.permute(0, 2, 1)
+
+        if VERBOSE: print(f"x.shape reshape and permute: {x.shape}")
 
         # add the [CLS] token to the embed patch tokens
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -204,14 +264,17 @@ class VisionTransformer(nn.Module):
         # add positional encoding to each token
         x = x + self.interpolate_pos_encoding(x, w, h)
 
-        return self.pos_drop(x)
+        return self.pos_drop(x), i, j, ww, hh
 
-    def forward(self, x):
-        x = self.prepare_tokens(x)
+    def forward(self, x, crop=True):
+        x, i, j, ww, hh = self.prepare_tokens(x, crop)
+        if VERBOSE: print(f"prepare_tokens.shape:{x.shape}")
+
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        return x[:, 0]
+        
+        return x, i, j, ww, hh
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)
@@ -248,6 +311,7 @@ def vit_small(patch_size=16, **kwargs):
 
 
 def vit_base(patch_size=16, **kwargs):
+    logger.info("Infooo")
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
