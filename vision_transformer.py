@@ -226,7 +226,7 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
 
-    def prepare_tokens(self, x_orig, crop=True):
+    def prepare_tokens(self, x_orig, i_crop, crop=True):
         B, nc, w, h = x_orig.shape
         x = self.patch_embed(x_orig)  # patch linear embedding
         if VERBOSE: print(f"x.shape before crop: {x.shape}")
@@ -254,7 +254,9 @@ class VisionTransformer(nn.Module):
 
             x = x.reshape(x.shape[0], x.shape[1], -1)
             x = x.permute(0, 2, 1)
-
+        if crop and i_crop:
+            x[0, i_crop, :] = 0
+            print(f"{i} cropped")
         if VERBOSE: print(f"x.shape reshape and permute: {x.shape}")
 
         # add the [CLS] token to the embed patch tokens
@@ -266,8 +268,8 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x), i, j, ww, hh
 
-    def forward(self, x, crop=True):
-        x, i, j, ww, hh = self.prepare_tokens(x, crop)
+    def forward(self, x, i_crop, crop=True):
+        x, i, j, ww, hh = self.prepare_tokens(x, i_crop, crop)
         if VERBOSE: print(f"prepare_tokens.shape:{x.shape}")
 
         for blk in self.blocks:
@@ -276,8 +278,8 @@ class VisionTransformer(nn.Module):
         
         return x, i, j, ww, hh
 
-    def get_last_selfattention(self, x):
-        x = self.prepare_tokens(x)
+    def get_last_selfattention(self, x, crop=False):
+        x, i, j, ww, hh = self.prepare_tokens(x, crop)
         for i, blk in enumerate(self.blocks):
             if i < len(self.blocks) - 1:
                 x = blk(x)
