@@ -254,7 +254,7 @@ class VisionTransformer(nn.Module):
 
             x = x.reshape(x.shape[0], x.shape[1], -1)
             x = x.permute(0, 2, 1)
-        if crop and i_crop:
+        if crop and i_crop is not None:
             x[0, i_crop, :] = 0
             print(f"{i_crop} cropped")
         if VERBOSE: print(f"x.shape reshape and permute: {x.shape}")
