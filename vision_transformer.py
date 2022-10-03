@@ -232,7 +232,7 @@ class VisionTransformer(nn.Module):
         if VERBOSE: print(f"x.shape before crop: {x.shape}")
         i, j, ww, hh = 0, 0, 0, 0
         
-        if crop and not i_crop:
+        if crop and i_crop is None:
             # Random crop between size 5% and 10%
             x = x.permute(0, 2, 1)
             n_square = np.sqrt(x.shape[-1]).astype(int)
